@@ -5,16 +5,25 @@ Run:  streamlit run app.py
 
 from __future__ import annotations
 
-from pathlib import Path
+import math
+import os
+import threading
+import time
 
 import pandas as pd
 import streamlit as st
 
 import charts
+import fetch_data
 from analysis import NA, add_derived, fmt_money_big, fmt_num, fmt_pct, growth_valuation
+from fetch_data import (DEFAULT_URL, FetchError, claim_refresh, fetch_and_save, fmt_ct, get_data,
+                        has_key, load_env)
 
-DATA_PATH = Path(__file__).parent / "data" / "fundamentals.csv"
-DATA_AS_OF = "Oct 10, 2026"
+load_env()
+URL_TEMPLATE = os.environ.get("FINVIZ_EXPORT_URL") or DEFAULT_URL  # holds the placeholder, never the key
+INTERVALS = [1, 5, 15]           # minutes
+REFRESH_COOLDOWN = 60            # seconds: "Refresh now" forces at most one extra request per minute
+TICK_SECONDS = 15                # how often auto-refresh checks whether the cache has expired
 
 PCT_COLS = ["SMA50", "SMA200", "Perf YTD", "Perf 3Y", "Perf 5Y", "EPS This Y", "EPS Next Y",
             "Gross Margin", "Insider Own", "% from 52W High", "52W Position"]
@@ -22,9 +31,59 @@ PCT_COLS = ["SMA50", "SMA200", "Perf YTD", "Perf 3Y", "Perf 5Y", "EPS This Y", "
 st.set_page_config(page_title="Semiconductor Stock Financial Analysis", page_icon="📊", layout="wide")
 
 
-@st.cache_data
-def load_data(path: str, mtime: float) -> pd.DataFrame:  # mtime busts the cache when the file changes
-    return add_derived(pd.read_csv(path))
+@st.cache_resource
+def request_log() -> dict:
+    """Shared by every session and tab on this server: when Finviz was last called."""
+    return {"last": 0.0, "lock": threading.Lock()}
+
+
+def _download(url_template: str) -> str | None:
+    """Exactly one Finviz request. Returns an error message instead of raising, so a failure is
+    cached for the interval too and a Finviz outage can't trigger a request on every reload."""
+    log = request_log()
+    log["last"] = time.time()
+    try:
+        fetch_and_save(url_template)
+        return None
+    except FetchError as exc:
+        return str(exc)
+    except Exception as exc:  # never show a traceback: it could contain the authenticated URL
+        return f"Unexpected error while refreshing ({type(exc).__name__})."
+    finally:
+        log["last"] = time.time()
+
+
+# One cache per interval, so each TTL equals its interval. These must be separate functions:
+# Streamlit keys a cache by function name and source, so one function wrapped three times shares one.
+@st.cache_data(ttl=60, show_spinner="Refreshing from Finviz…")
+def download_every_1m(url_template: str) -> str | None:
+    return _download(url_template)
+
+
+@st.cache_data(ttl=5 * 60, show_spinner="Refreshing from Finviz…")
+def download_every_5m(url_template: str) -> str | None:
+    return _download(url_template)
+
+
+@st.cache_data(ttl=15 * 60, show_spinner="Refreshing from Finviz…")
+def download_every_15m(url_template: str) -> str | None:
+    return _download(url_template)
+
+
+DOWNLOADERS = {1: download_every_1m, 5: download_every_5m, 15: download_every_15m}
+
+
+def saved_mtime() -> float:
+    path = fetch_data.CLEAN_PATH
+    return path.stat().st_mtime if path.exists() else 0.0
+
+
+@st.fragment(run_every=TICK_SECONDS)
+def auto_refresh(interval_s: float, shown_mtime: float) -> None:
+    """Rerun the whole app once this interval's cache has expired, or when another tab saved newer data."""
+    # +1s: file times are finer than the displayed datetime, so an exact comparison would loop forever.
+    if time.time() - request_log()["last"] >= interval_s + 2 or saved_mtime() > shown_mtime + 1:
+        st.rerun(scope="app")
 
 
 def styled(df: pd.DataFrame):
@@ -41,12 +100,42 @@ def styled(df: pd.DataFrame):
 
 
 # ---------- data ----------
-if not DATA_PATH.exists():
-    st.error("No data yet. Run `python fetch_data.py` (live Finviz download) or "
-             "`python fetch_data.py --from-file data/sample_export.csv` (saved sample), then refresh.")
-    st.stop()
+live_ok = has_key()
+with st.sidebar:
+    st.header("Data")
+    no_key_help = None if live_ok else "Add FINVIZ_API_KEY to .env to enable live data."
+    refresh = st.button("Refresh now", disabled=not live_ok, help=no_key_help)
+    auto = st.toggle("Auto-refresh", value=False, disabled=not live_ok, help=no_key_help)
+    interval = st.radio("Refresh interval", INTERVALS, index=INTERVALS.index(5), horizontal=True,
+                        format_func=lambda m: f"{m} min", disabled=not live_ok,
+                        help="Finviz is called at most once per interval, however many tabs or reloads.")
+    last_updated = st.empty()
 
-df_all = load_data(str(DATA_PATH), DATA_PATH.stat().st_mtime)
+if refresh:
+    allowed, since = claim_refresh(request_log(), REFRESH_COOLDOWN)
+    if allowed:
+        for downloader in DOWNLOADERS.values():
+            downloader.clear()
+    else:
+        st.sidebar.info(f"Finviz was called {int(since)}s ago. Try again in "
+                        f"{math.ceil(REFRESH_COOLDOWN - since)}s.")
+
+
+def fetch() -> None:
+    error = DOWNLOADERS[interval](URL_TEMPLATE)
+    if error:
+        raise FetchError(error)
+
+
+result = get_data(fetch)
+if result.df is None:
+    st.error(result.message)
+    st.stop()
+last_updated.caption(f"Last updated: {fmt_ct(result.updated_at)}")
+if auto:
+    auto_refresh(interval * 60, result.updated_at.timestamp())
+
+df_all = add_derived(result.df)
 
 # ---------- sidebar filters ----------
 with st.sidebar:
@@ -72,8 +161,10 @@ with st.sidebar:
 
 # ---------- header ----------
 st.title("Semiconductor Stock Financial Analysis")
-st.caption(f"Data as of {DATA_AS_OF}, from a Finviz Elite screener export · "
+st.caption(f"Data as of {fmt_ct(result.updated_at)}, from a Finviz Elite screener export · "
            "Large-cap (> \\$10B) US semiconductor companies")
+if result.message:
+    (st.info if not live_ok else st.warning)(result.message)
 
 if df.empty:
     st.info("No companies match these filters. Widen the market cap range or clear the ticker filter.")

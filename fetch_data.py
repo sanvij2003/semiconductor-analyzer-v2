@@ -13,6 +13,7 @@ Cleaning rules (verified against the live Finviz export):
     - Blank cells are missing values. The "No." row-number column is dropped.
 
 The API key is read from the environment (or a .env file) and is never printed.
+The app calls get_data(), which falls back to the last saved file when a download fails.
 """
 
 from __future__ import annotations
@@ -21,14 +22,19 @@ import argparse
 import os
 import sys
 import time
+from dataclasses import dataclass
+from datetime import datetime
 from io import StringIO
 from pathlib import Path
+from typing import Callable
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 DATA_DIR = Path(__file__).parent / "data"
 RAW_PATH = DATA_DIR / "raw_export.csv"
 CLEAN_PATH = DATA_DIR / "fundamentals.csv"
+CT = ZoneInfo("America/Chicago")
 
 # Default screen: large-cap (> $10B) US semiconductors, custom columns.
 DEFAULT_URL = (
@@ -65,6 +71,14 @@ REQUIRED_COLS = ["Ticker", "Company", "Market Cap", "Price", "52W Range"] + PERC
 MIN_SECONDS_BETWEEN_REQUESTS = 0.6  # Finviz Elite allows 10 requests per 5 seconds
 
 
+class FetchError(RuntimeError):
+    """A download or cleaning failure. The message is safe to show: it never contains the key or URL."""
+
+
+def has_key() -> bool:
+    return bool(os.environ.get("FINVIZ_API_KEY", "").strip())
+
+
 def load_env() -> None:
     """Load a local .env file if python-dotenv is installed."""
     try:
@@ -80,9 +94,9 @@ def download(url_template: str) -> str:
 
     key = os.environ.get("FINVIZ_API_KEY", "").strip()
     if not key:
-        sys.exit("FINVIZ_API_KEY is not set. Add it to .env or your environment.")
+        raise FetchError("FINVIZ_API_KEY is not set. Add it to .env or your environment.")
     if "{FINVIZ_API_KEY}" not in url_template:
-        sys.exit("The URL must contain the placeholder auth={FINVIZ_API_KEY}, not a real key.")
+        raise FetchError("The URL must contain the placeholder auth={FINVIZ_API_KEY}, not a real key.")
 
     url = url_template.replace("{FINVIZ_API_KEY}", key)
     time.sleep(MIN_SECONDS_BETWEEN_REQUESTS)
@@ -90,13 +104,13 @@ def download(url_template: str) -> str:
         resp = requests.get(url, timeout=30, allow_redirects=True,
                             headers={"User-Agent": "Mozilla/5.0"})
     except requests.RequestException as exc:
-        # Do not include the URL in the message: it contains the key.
-        sys.exit(f"Network error while downloading the Finviz export ({type(exc).__name__}).")
+        # Do not include the URL in the message, or chain the original error: both contain the key.
+        raise FetchError(f"Network error while downloading the Finviz export ({type(exc).__name__}).") from None
     if resp.status_code != 200:
-        sys.exit(f"Finviz returned HTTP {resp.status_code}. Check the key and the export URL.")
+        raise FetchError(f"Finviz returned HTTP {resp.status_code}. Check the key and the export URL.")
     text = resp.text
     if text.lstrip().lower().startswith("<"):
-        sys.exit("Finviz returned a web page instead of CSV. The key is probably invalid or expired.")
+        raise FetchError("Finviz returned a web page instead of CSV. The key is probably invalid or expired.")
     return text
 
 
@@ -136,6 +150,107 @@ def clean(raw: pd.DataFrame) -> pd.DataFrame:
     return df[order].sort_values("Market Cap", ascending=False).reset_index(drop=True)
 
 
+def save(text: str) -> pd.DataFrame:
+    """Clean an export and save it. Nothing is written unless cleaning succeeds."""
+    try:
+        cleaned = clean(pd.read_csv(StringIO(text), dtype=str, keep_default_na=False))
+    except ValueError as exc:  # includes pandas parser errors and missing columns
+        raise FetchError(f"The Finviz export could not be read: {exc}") from None
+
+    DATA_DIR.mkdir(exist_ok=True)
+    raw_tmp, clean_tmp = RAW_PATH.with_suffix(".csv.tmp"), CLEAN_PATH.with_suffix(".csv.tmp")
+    try:
+        # Write to temp files and swap them in, so a failed write never damages the last good data.
+        raw_tmp.write_text(text, encoding="utf-8")
+        cleaned.to_csv(clean_tmp, index=False)
+        os.replace(raw_tmp, RAW_PATH)
+        os.replace(clean_tmp, CLEAN_PATH)
+    except OSError as exc:
+        raise FetchError(f"Couldn't save the data file ({type(exc).__name__}).") from None
+    return cleaned
+
+
+def fetch_and_save(url_template: str) -> pd.DataFrame:
+    """One request to Finviz, then clean and save. Raises FetchError on any failure."""
+    return save(download(url_template))
+
+
+def load_saved() -> tuple[pd.DataFrame | None, datetime | None]:
+    """The last saved clean data and when it was written, or (None, None) if there is none."""
+    if not CLEAN_PATH.exists():
+        return None, None
+    updated = datetime.fromtimestamp(CLEAN_PATH.stat().st_mtime, tz=CT)
+    return pd.read_csv(CLEAN_PATH), updated
+
+
+def fmt_ct(dt: datetime) -> str:
+    """'Oct 15, 2026 2:05 PM CT' (built by hand: Windows strftime has no %-I)."""
+    dt = dt.astimezone(CT)
+    return f"{dt:%b} {dt.day}, {dt.year} {dt.hour % 12 or 12}:{dt:%M} {dt:%p} CT"
+
+
+def claim_refresh(log: dict, cooldown: float, now: float | None = None) -> tuple[bool, float]:
+    """A manual refresh may call Finviz only if the last request was at least `cooldown` seconds ago.
+
+    log holds "last" (time of the last request) and "lock". Returns (allowed, seconds since the last
+    request). When allowed, the request time is recorded under the lock, so of several tabs clicking
+    at once only one wins.
+    """
+    now = time.time() if now is None else now
+    with log["lock"]:
+        since = now - log["last"]
+        if since < cooldown:
+            return False, since
+        log["last"] = now
+        return True, since
+
+
+def _scrub(message: str) -> str:
+    """Belt and braces: remove the key from any message that will be shown."""
+    key = os.environ.get("FINVIZ_API_KEY", "").strip()
+    return message.replace(key, "***") if key else message
+
+
+@dataclass
+class DataResult:
+    df: pd.DataFrame | None       # None only when there is no data at all
+    updated_at: datetime | None
+    live: bool                    # True when the latest refresh succeeded
+    message: str | None = None    # warning (df present) or error (df is None)
+
+
+def get_data(fetch: Callable[[], object]) -> DataResult:
+    """Refresh with fetch() if a key is set, otherwise or on failure fall back to the saved file.
+
+    fetch must make at most one request and raise FetchError on failure. Never raises.
+    """
+    if not has_key():
+        df, updated = load_saved()
+        if df is None:
+            return DataResult(None, None, False,
+                              "No data yet. Add FINVIZ_API_KEY to .env for live data, or run "
+                              "`python fetch_data.py --from-file data/sample_export.csv`.")
+        return DataResult(df, updated, False,
+                          f"FINVIZ_API_KEY isn't set in .env, so live refresh is off. "
+                          f"Showing saved data, last updated {fmt_ct(updated)}.")
+    try:
+        fetch()
+        error = None
+    except FetchError as exc:
+        error = _scrub(str(exc))
+    except Exception as exc:  # never crash the app, and never show a traceback that could hold the URL
+        error = f"Unexpected error while refreshing ({type(exc).__name__})."
+
+    df, updated = load_saved()
+    if error is None and df is not None:
+        return DataResult(df, updated, True)
+    if df is None:
+        return DataResult(None, None, False, f"Couldn't download from Finviz: {error} No saved data yet.")
+    return DataResult(df, updated, False,
+                      f"Couldn't refresh from Finviz: {error} Showing the last good data, "
+                      f"last updated {fmt_ct(updated)}.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--url", help="Export URL template containing auth={FINVIZ_API_KEY}")
@@ -143,18 +258,13 @@ def main() -> None:
     args = parser.parse_args()
 
     load_env()
-    DATA_DIR.mkdir(exist_ok=True)
-
-    if args.from_file:
-        text = Path(args.from_file).read_text(encoding="utf-8-sig")
-    else:
-        url = args.url or os.environ.get("FINVIZ_EXPORT_URL") or DEFAULT_URL
-        text = download(url)
-
-    RAW_PATH.write_text(text, encoding="utf-8")
-    raw = pd.read_csv(StringIO(text), dtype=str, keep_default_na=False)
-    cleaned = clean(raw)
-    cleaned.to_csv(CLEAN_PATH, index=False)
+    try:
+        if args.from_file:
+            cleaned = save(Path(args.from_file).read_text(encoding="utf-8-sig"))
+        else:
+            cleaned = fetch_and_save(args.url or os.environ.get("FINVIZ_EXPORT_URL") or DEFAULT_URL)
+    except FetchError as exc:
+        sys.exit(str(exc))
 
     print(f"Saved {RAW_PATH.name} and {CLEAN_PATH.name}: "
           f"{len(cleaned)} stocks, {len(cleaned.columns)} columns.\n")

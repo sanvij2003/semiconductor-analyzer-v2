@@ -49,6 +49,19 @@ Open http://localhost:8501. The app runs only on your computer.
 pytest
 ```
 
+## Live data
+
+With `FINVIZ_API_KEY` in `.env`, the app downloads the export itself; the sidebar's **Data**
+section controls it.
+- **Refresh now** downloads fresh data. It's limited to one Finviz request per 60 seconds;
+  clicking sooner tells you how long to wait.
+- **Auto-refresh** re-downloads every 1, 5 or 15 minutes (default 5). Finviz is called at most once
+  per interval, however many browser tabs are open or reloads you do.
+- **Last updated** shows when the data was saved, in Central Time.
+- If a download fails, the app keeps showing the last good data with a warning, and the saved file
+  is never overwritten by a bad download. Without a key, it shows the saved data and live refresh
+  is turned off.
+
 ## Data and cleaning rules
 
 Screen: Industry = Semiconductors, Country = USA, Market Cap = Large (over $10B). 22 stocks.

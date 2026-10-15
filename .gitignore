@@ -2,6 +2,9 @@
 .env
 .streamlit/secrets.toml
 
+# Personal Claude Code permissions
+.claude/settings.local.json
+
 # Finviz data is licensed to your account: keep it out of the repo
 data/
 
