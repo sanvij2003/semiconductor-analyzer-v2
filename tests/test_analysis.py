@@ -14,6 +14,9 @@ SAMPLE = Path(__file__).parent.parent / "data" / "sample_export.csv"
 
 @pytest.fixture(scope="module")
 def df():
+    if not SAMPLE.exists():
+        pytest.skip(f"{SAMPLE.relative_to(SAMPLE.parent.parent)} not found: data/ is gitignored, "
+                    "so add the Finviz sample export locally to run these tests")
     raw = pd.read_csv(StringIO(SAMPLE.read_text()), dtype=str, keep_default_na=False)
     return add_derived(clean(raw)).set_index("Ticker", drop=False)
 
