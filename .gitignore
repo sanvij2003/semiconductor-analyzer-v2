@@ -1,0 +1,12 @@
+# Secrets
+.env
+.streamlit/secrets.toml
+
+# Finviz data is licensed to your account: keep it out of the repo
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
